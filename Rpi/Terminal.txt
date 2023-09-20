@@ -1,0 +1,5 @@
+gcc -c RpiUart.c -o RpiUart.o
+
+gcc -Wall -o binFileUpdate binFileUpdate.c RpiUart.o -lusb-1.0 -llogger -lwiringPi -lcurl
+
+sudo ./binFileUpdate F4LED.bin 1
