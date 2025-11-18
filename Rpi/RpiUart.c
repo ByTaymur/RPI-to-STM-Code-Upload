@@ -230,37 +230,36 @@ int RpiUart_OpenComport(int comport_number, int baudrate, const char *mode, int 
 }
 
 fd_set readfds;
- struct timeval timeout;
+struct timeval timeout;
+
 int RpiUart_PollComport(int comport_number, unsigned char *buf, int size)
 {
- // printf("-------------------RpiUart_PollComport---------------------\n");
-  int n;
-   
-   
+  int n = 0;
+
   FD_ZERO(&readfds);
   FD_SET(Cport[comport_number], &readfds);
 
-  timeout.tv_sec = 1;
-  timeout.tv_usec = 10;
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 100000;  // 100ms timeout
 
-  select(Cport[comport_number] + 1, &readfds, NULL, NULL, &timeout);
-  if (FD_ISSET(Cport[comport_number], &readfds)) {
-          while ((n = read(Cport[comport_number], buf, size)) > 0) 
-          {
-           // printf("-------------------11111111----------------\n");
-            }
-            }
-            
-            
- // n = read(Cport[comport_number], buf, size);
- // printf("-------------------%c-----%d----------------\n",buf,size);
-  if(n < 0)
+  int ret = select(Cport[comport_number] + 1, &readfds, NULL, NULL, &timeout);
+
+  if (ret > 0 && FD_ISSET(Cport[comport_number], &readfds))
   {
-    printf("-------------------!!!!!!!!!!!!!!----------------\n");
-    if(errno == EAGAIN)  return 0;
+    n = read(Cport[comport_number], buf, size);
+    if(n < 0)
+    {
+      if(errno == EAGAIN || errno == EWOULDBLOCK)
+        return 0;
+      return -1;
+    }
+  }
+  else if(ret < 0)
+  {
+    return -1;
   }
 
-  return(n);
+  return n;
 }
 
 
