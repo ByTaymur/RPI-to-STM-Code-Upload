@@ -200,8 +200,18 @@ static bool read_binary_file(const char *filename)
 
     /* Get file size */
     fseek(fp, 0L, SEEK_END);
-    g_bin_file_size = ftell(fp);
+    long file_size = ftell(fp);
     fseek(fp, 0L, SEEK_SET);
+
+    /* Check ftell() error */
+    if(file_size < 0)
+    {
+        printf("ERROR: Cannot determine file size\n");
+        fclose(fp);
+        return false;
+    }
+
+    g_bin_file_size = (uint32_t)file_size;
 
     /* Check size */
     if(g_bin_file_size == 0)

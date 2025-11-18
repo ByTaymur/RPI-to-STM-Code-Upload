@@ -381,7 +381,18 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
 	DataFlagCount=0;
 	HAL_GPIO_TogglePin(BLed_GPIO_Port, BLed_Pin);
+
+	// Buffer overflow protection
+	if(Index >= MAX_BLOCK_SIZE)
+	{
+		printf("ERROR: Buffer overflow!\r\n");
+		Index = 0;
+		HAL_UART_Receive_IT(&huart1, &RPiDataByte, 1);
+		return;
+	}
+
 	Block[Index++]=RPiDataByte;
+
 	if(IlkSifre!=10)
 	{
 			if(( '{' == RPiDataByte || Block[0]== 0x7B) && IlkSifre==0) IlkSifre=1;
@@ -389,6 +400,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 			{
 					Block[0]=0;	Block[5]=0;
 					BLeng = Block[1]<<24 | Block[2]<<16 | Block[3]<<8 | Block[4];
+
+					// Validate firmware size (max 47KB for F103)
+					if(BLeng > (47 * 1024))
+					{
+						printf("ERROR: Firmware too large (%lu bytes). Max: 47KB\r\n", BLeng);
+						IlkSifre = 0;
+						Index = 0;
+						HAL_UART_Receive_IT(&huart1, &RPiDataByte, 1);
+						return;
+					}
+
 					BlockLeng=BLeng;
 					DataCount++;
 					Index=0;
@@ -404,7 +426,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 			MaxIndex = 1024;
 			current_app_size=MaxIndex+current_app_size;
 		}
-		if(BLeng<1024)
+		else if(BLeng<1024)  // FIXED: Changed to else if
 		{
 			MaxIndex = BLeng;
 			current_app_size=MaxIndex+current_app_size;
@@ -418,11 +440,13 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 			}
 		}
 		Index=0;
-		Sum[0] =( Block[0] + RPiDataByte ) & 0xFF;
+		// CRITICAL FIX: Use correct checksum calculation
+		// Calculate checksum as (first_byte + last_byte) & 0xFF
+		// The last byte is at position IndexSum-1 (before Index was reset)
+		Sum[0] = (Block[0] + Block[IndexSum - 1]) & 0xFF;
 		memset(Block, 0, sizeof(Block));
 	}
 	HAL_UART_Receive_IT(&huart1, &RPiDataByte, 1);
-	//HAL_UART_Receive_IT(&huart1, &RPiDataByte, 1);
 }
 static void Firmware_Update(void)
 {
