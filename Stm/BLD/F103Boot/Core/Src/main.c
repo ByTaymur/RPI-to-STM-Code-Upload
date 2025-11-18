@@ -28,8 +28,33 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#define MAX_BLOCK_SIZE          ( 1024 )                  //1KB
-#define ETX_APP_START_ADDRESS   0x08004400
+// Memory configuration
+#define MAX_BLOCK_SIZE          1024                      // 1KB block size
+#define ETX_APP_START_ADDRESS   0x08004400                // Application start address
+#define MAX_FIRMWARE_SIZE       (47 * 1024)               // 47KB max for F103
+
+// Protocol constants
+#define PROTOCOL_START_BYTE     '{'
+#define PROTOCOL_END_BYTE       '}'
+#define PROTOCOL_ACK_BYTE       'O'
+#define PROTOCOL_NACK_BYTE      'N'
+
+// Handshake validation
+#define HANDSHAKE_MIN_INDEX     4
+#define HANDSHAKE_MAX_INDEX     8
+
+// Flash configuration
+#define FLASH_ERASE_PAGES       47                        // Number of pages to erase
+
+// State machine - Clean enum instead of magic numbers
+typedef enum {
+    BOOTLOADER_STATE_IDLE = 0,
+    BOOTLOADER_STATE_HANDSHAKE_RECEIVED = 10,
+    BOOTLOADER_STATE_TRANSFERRING = 20,
+    BOOTLOADER_STATE_COMPLETE = 30,
+    BOOTLOADER_STATE_ERROR = 255
+} BootloaderState_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -58,42 +83,62 @@ static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void Application( void );
 static void Firmware_Update( void );
+
+// Helper functions for better code organization
+static bool Validate_Handshake_Byte(uint8_t byte);
+static bool Parse_Firmware_Size(void);
+static void Send_ACK_Response(void);
+static void Handle_Block_Complete(void);
+static uint8_t Calculate_Checksum(const uint8_t *block, uint32_t size);
+static void Reset_Transfer_State(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// UART RX
-uint8_t RPiDataByte=0;
+// ============================================================================
+// BOOTLOADER STATE MACHINE VARIABLES
+// ============================================================================
+static BootloaderState_t bootloader_state = BOOTLOADER_STATE_IDLE;
+static uint8_t ack_byte = PROTOCOL_ACK_BYTE;
 
-// Data block reception
-uint8_t Block[1024];
-uint16_t Index=0;
-uint32_t IndexSum=0;
+// ============================================================================
+// UART RECEPTION VARIABLES
+// ============================================================================
+static uint8_t uart_rx_byte = 0;
 
-// Protocol state machine
-uint8_t IlkSifre=0;  // 0=idle, 10=handshake_ok, 20=transferring
-uint8_t DataGonder[]={'O'};  // ACK byte
+// ============================================================================
+// DATA BLOCK RECEPTION VARIABLES
+// ============================================================================
+static uint8_t data_block[MAX_BLOCK_SIZE];
+static uint16_t block_index = 0;
+static uint32_t block_index_saved = 0;  // Saved before reset for checksum
 
-// Size tracking
-uint32_t BLeng=1024;
-uint32_t BlockLeng=1024;
-uint32_t MaxIndex=1024;
-uint16_t current_app_size=0;
+// ============================================================================
+// FIRMWARE SIZE TRACKING
+// ============================================================================
+static uint32_t firmware_total_size = 0;
+static uint32_t firmware_received_size = 0;
+static uint32_t bytes_remaining = MAX_BLOCK_SIZE;
+static uint32_t current_block_size = MAX_BLOCK_SIZE;
 
-// Checksum
-uint8_t Sum[1]={0};
+// ============================================================================
+// CHECKSUM VARIABLES
+// ============================================================================
+static uint8_t checksum_response[1] = {0};
 
-// Flash write
-uint16_t application_write_idx = 0;
+// ============================================================================
+// FLASH WRITE VARIABLES
+// ============================================================================
+static uint32_t flash_write_index = 0;
 
-// Counters
-uint8_t DataCount=0;
-uint32_t DataFlagCount=0;
+// ============================================================================
+// TIMEOUT AND STATUS COUNTERS
+// ============================================================================
+static uint8_t handshake_count = 0;
+static uint32_t idle_timeout_counter = 0;
+static bool transfer_error_flag = false;
 
-// Removed unused variables:
-// BlockNumber1, BlockNumber2, BlockNumber3
-// BlockLeng1-4, BlockOk, BNumber, IndexCount
-// Conter, BlockTest, BLengC, Sum1, Sum2, application_size
 /* USER CODE END 0 */
 
 /**
@@ -128,19 +173,32 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  // Print banner
+  printf("\r\n");
+  printf("╔════════════════════════════════════════════════════════════════╗\r\n");
+  printf("║       STM32F103 Bootloader v3.0 (Production Quality)          ║\r\n");
+  printf("╠════════════════════════════════════════════════════════════════╣\r\n");
+  printf("║  Application: 0x%08lX                                      ║\r\n", ETX_APP_START_ADDRESS);
+  printf("║  Max Size:    %d KB                                         ║\r\n", MAX_FIRMWARE_SIZE / 1024);
+  printf("║  Block Size:  %d bytes                                      ║\r\n", MAX_BLOCK_SIZE);
+  printf("╚════════════════════════════════════════════════════════════════╝\r\n");
+  printf("\r\n");
+
+  // Start UART reception in interrupt mode
+  HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+
+  // Run firmware update process
+  Firmware_Update();
+
+  // Jump to user application
+  Application();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-	HAL_UART_Receive_IT(&huart1, &RPiDataByte, 1);
-	printf("Program Start...\r\n");
-	 Firmware_Update();
-	 Application();
-
   while (1)
   {
-
-
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -307,195 +365,365 @@ int fputc(int ch, FILE *f)
 }
 
 
-static HAL_StatusTypeDef write_data_to_flash_app( uint8_t *data,
-                                        uint16_t data_len, bool is_first_block )
+/**
+  * @brief  Write data block to application flash area
+  * @param  data: Pointer to data buffer
+  * @param  data_len: Length of data in bytes
+  * @param  is_first_block: true if this is the first block (triggers erase)
+  * @retval HAL_StatusTypeDef
+  */
+static HAL_StatusTypeDef write_data_to_flash_app(uint8_t *data,
+                                                  uint16_t data_len,
+                                                  bool is_first_block)
 {
-  HAL_StatusTypeDef ret;
+    HAL_StatusTypeDef status = HAL_OK;
 
-  do
-  {
-    ret = HAL_FLASH_Unlock();
-    if( ret != HAL_OK )
+    // Validate input parameters
+    if(data == NULL || data_len == 0)
     {
-      break;
+        printf("ERROR: Invalid flash write parameters\r\n");
+        return HAL_ERROR;
     }
 
-    //No need to erase every time. Erase only the first time.
-    if( is_first_block )
+    // Unlock flash for write operations
+    status = HAL_FLASH_Unlock();
+    if(status != HAL_OK)
     {
-      //printf("Erasing the Flash memory...\r\n");
-      //Erase the Flash
-      FLASH_EraseInitTypeDef EraseInitStruct;
-      uint32_t SectorError;
-
-      EraseInitStruct.TypeErase     = FLASH_TYPEERASE_PAGES;
-      EraseInitStruct.PageAddress   = ETX_APP_START_ADDRESS;
-      EraseInitStruct.NbPages       = 47;                     //47 Pages
-
-      // CRITICAL: Disable interrupts during flash erase to prevent corruption
-      __disable_irq();
-      ret = HAL_FLASHEx_Erase( &EraseInitStruct, &SectorError );
-      __enable_irq();
-
-      if( ret != HAL_OK )
-      {
-        break;
-      }
-      application_write_idx = 0;
+        printf("ERROR: Flash unlock failed\r\n");
+        return status;
     }
 
-    for(int i = 0; i < data_len/2; i++)
+    // Erase flash on first block
+    if(is_first_block)
     {
-      uint16_t halfword_data = data[i * 2] | (data[i * 2 + 1] << 8);
-      ret = HAL_FLASH_Program( FLASH_TYPEPROGRAM_HALFWORD,
-                               (ETX_APP_START_ADDRESS + application_write_idx ),
-                               halfword_data
-                             );
-      if( ret == HAL_OK )
-      {
-        //update the data count
-        application_write_idx += 2;
-      }
-      else
-      {
-       // printf("Flash Write Error...HALT!!!\r\n");
-        break;
-      }
+        printf("Erasing application flash area...\r\n");
+
+        FLASH_EraseInitTypeDef erase_config;
+        uint32_t erase_error = 0;
+
+        erase_config.TypeErase = FLASH_TYPEERASE_PAGES;
+        erase_config.PageAddress = ETX_APP_START_ADDRESS;
+        erase_config.NbPages = FLASH_ERASE_PAGES;
+
+        // CRITICAL: Disable interrupts during erase to prevent corruption
+        __disable_irq();
+        status = HAL_FLASHEx_Erase(&erase_config, &erase_error);
+        __enable_irq();
+
+        if(status != HAL_OK)
+        {
+            printf("ERROR: Flash erase failed (error: 0x%08lX)\r\n", erase_error);
+            HAL_FLASH_Lock();
+            return status;
+        }
+
+        flash_write_index = 0;
+        printf("Flash erase complete\r\n");
     }
 
-    if( ret != HAL_OK )
+    // Write data (F103 uses HALFWORD programming)
+    uint32_t write_address = ETX_APP_START_ADDRESS + flash_write_index;
+
+    for(uint16_t i = 0; i < data_len; i += 2)
     {
-      break;
+        uint16_t halfword;
+
+        // Handle odd data length
+        if(i + 1 < data_len)
+        {
+            halfword = data[i] | (data[i + 1] << 8);
+        }
+        else
+        {
+            halfword = data[i] | 0xFF00;  // Pad with 0xFF
+        }
+
+        status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_HALFWORD,
+                                   write_address,
+                                   halfword);
+
+        if(status != HAL_OK)
+        {
+            printf("ERROR: Flash write failed at 0x%08lX\r\n", write_address);
+            break;
+        }
+
+        write_address += 2;
+        flash_write_index += 2;
     }
 
-    ret = HAL_FLASH_Lock();
-    if( ret != HAL_OK )
-    {
-      break;
-    }
-  }while( false );
+    // Lock flash
+    HAL_FLASH_Lock();
 
-  return ret;
+    return status;
 }
 
+/**
+  * @brief  Calculate checksum (first byte + last byte) & 0xFF
+  * @param  block: Pointer to data block
+  * @param  size: Size of block
+  * @retval Calculated checksum
+  */
+static uint8_t Calculate_Checksum(const uint8_t *block, uint32_t size)
+{
+    if(block == NULL || size == 0)
+    {
+        return 0;
+    }
+
+    return (block[0] + block[size - 1]) & 0xFF;
+}
+
+/**
+  * @brief  Reset transfer state to idle
+  * @retval None
+  */
+static void Reset_Transfer_State(void)
+{
+    bootloader_state = BOOTLOADER_STATE_IDLE;
+    block_index = 0;
+    firmware_total_size = 0;
+    firmware_received_size = 0;
+    bytes_remaining = MAX_BLOCK_SIZE;
+    current_block_size = MAX_BLOCK_SIZE;
+    transfer_error_flag = false;
+    memset(data_block, 0, sizeof(data_block));
+}
+
+/**
+  * @brief  UART RX Callback - Called on each byte received
+  * @param  huart: UART handle
+  * @retval None
+  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-	DataFlagCount=0;
-	HAL_GPIO_TogglePin(BLed_GPIO_Port, BLed_Pin);
+    // Reset idle counter
+    idle_timeout_counter = 0;
 
-	// Buffer overflow protection
-	if(Index >= MAX_BLOCK_SIZE)
-	{
-		printf("ERROR: Buffer overflow!\r\n");
-		Index = 0;
-		HAL_UART_Receive_IT(&huart1, &RPiDataByte, 1);
-		return;
-	}
+    // LED toggle for activity indication
+    HAL_GPIO_TogglePin(BLed_GPIO_Port, BLed_Pin);
 
-	Block[Index++]=RPiDataByte;
+    // Buffer overflow protection - CRITICAL SAFETY CHECK
+    if(block_index >= MAX_BLOCK_SIZE)
+    {
+        printf("ERROR: Buffer overflow detected!\r\n");
+        transfer_error_flag = true;
+        block_index = 0;
+        HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+        return;
+    }
 
-	if(IlkSifre!=10)
-	{
-			if(( '{' == RPiDataByte || Block[0]== 0x7B) && IlkSifre==0) IlkSifre=1;
-			if( IlkSifre==1 &&( RPiDataByte == '}' || RPiDataByte ==  0x7D  ) && Index < 8  && Index > 4 )
-			{
-					Block[0]=0;	Block[5]=0;
-					BLeng = Block[1]<<24 | Block[2]<<16 | Block[3]<<8 | Block[4];
+    // Store received byte
+    data_block[block_index++] = uart_rx_byte;
 
-					// Validate firmware size (max 47KB for F103)
-					if(BLeng > (47 * 1024))
-					{
-						printf("ERROR: Firmware too large (%lu bytes). Max: 47KB\r\n", BLeng);
-						IlkSifre = 0;
-						Index = 0;
-						HAL_UART_Receive_IT(&huart1, &RPiDataByte, 1);
-						return;
-					}
+    // ===========================================================================
+    // HANDSHAKE STATE: Wait for {SIZE} packet
+    // ===========================================================================
+    if(bootloader_state != BOOTLOADER_STATE_TRANSFERRING)
+    {
+        // Look for start byte '{'
+        if((PROTOCOL_START_BYTE == uart_rx_byte || data_block[0] == 0x7B) &&
+           bootloader_state == BOOTLOADER_STATE_IDLE)
+        {
+            bootloader_state = BOOTLOADER_STATE_HANDSHAKE_RECEIVED;
+        }
 
-					BlockLeng=BLeng;
-					DataCount++;
-					Index=0;
-					IlkSifre=10;
-			}
-		}
-  if( Index == MaxIndex  )
-	{
-	  	IndexSum=Index;
-		if(BLeng>=1024)
-		{
-			BLeng=BLeng-MaxIndex;
-			MaxIndex = 1024;
-			current_app_size=MaxIndex+current_app_size;
-		}
-		else if(BLeng<1024)  // FIXED: Changed to else if
-		{
-			MaxIndex = BLeng;
-			current_app_size=MaxIndex+current_app_size;
-		}
-		if( ( Index == MAX_BLOCK_SIZE ) || ( current_app_size >= BlockLeng) )
-		{
-			printf("\rTransfer %d \r\n", ( BlockLeng-BLeng ));
-			// FIXED: Write actual block size (IndexSum) instead of always MAX_BLOCK_SIZE
-			if( write_data_to_flash_app(Block, IndexSum, (current_app_size <= MAX_BLOCK_SIZE) ) != HAL_OK )
-			{
-				printf("HALT!!!\r\n");
-			}
-		}
-		Index=0;
-		// CRITICAL FIX: Use correct checksum calculation
-		// Calculate checksum as (first_byte + last_byte) & 0xFF
-		// The last byte is at position IndexSum-1 (before Index was reset)
-		Sum[0] = (Block[0] + Block[IndexSum - 1]) & 0xFF;
-		memset(Block, 0, sizeof(Block));
-	}
-	HAL_UART_Receive_IT(&huart1, &RPiDataByte, 1);
+        // Check for complete handshake packet
+        if(bootloader_state == BOOTLOADER_STATE_HANDSHAKE_RECEIVED &&
+           (PROTOCOL_END_BYTE == uart_rx_byte || uart_rx_byte == 0x7D) &&
+           block_index < HANDSHAKE_MAX_INDEX && block_index > HANDSHAKE_MIN_INDEX)
+        {
+            // Parse firmware size (big-endian)
+            data_block[0] = 0;  // Clear markers
+            data_block[5] = 0;
+            firmware_total_size = ((uint32_t)data_block[1] << 24) |
+                                 ((uint32_t)data_block[2] << 16) |
+                                 ((uint32_t)data_block[3] << 8)  |
+                                 ((uint32_t)data_block[4]);
+
+            // Validate firmware size
+            if(firmware_total_size > MAX_FIRMWARE_SIZE)
+            {
+                printf("ERROR: Firmware too large (%lu bytes). Max: %d KB\r\n",
+                       firmware_total_size, MAX_FIRMWARE_SIZE / 1024);
+                Reset_Transfer_State();
+                HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
+                return;
+            }
+
+            // Handshake successful
+            printf("Handshake OK: Firmware size = %lu bytes\r\n", firmware_total_size);
+            bytes_remaining = firmware_total_size;
+            firmware_received_size = 0;
+            handshake_count++;
+            block_index = 0;
+            bootloader_state = BOOTLOADER_STATE_TRANSFERRING;
+        }
+    }
+
+    // ===========================================================================
+    // DATA TRANSFER STATE: Receive firmware blocks
+    // ===========================================================================
+    if(block_index == current_block_size)
+    {
+        // Save block index before reset (needed for checksum)
+        block_index_saved = block_index;
+
+        // Update remaining bytes
+        if(bytes_remaining >= MAX_BLOCK_SIZE)
+        {
+            bytes_remaining -= current_block_size;
+            current_block_size = MAX_BLOCK_SIZE;
+            firmware_received_size += current_block_size;
+        }
+        else if(bytes_remaining < MAX_BLOCK_SIZE)
+        {
+            current_block_size = bytes_remaining;
+            firmware_received_size += current_block_size;
+        }
+
+        // Write to flash if block is complete or transfer is done
+        if((block_index == MAX_BLOCK_SIZE) ||
+           (firmware_received_size >= firmware_total_size))
+        {
+            printf("\rProgress: %lu / %lu bytes\r\n",
+                   firmware_received_size, firmware_total_size);
+
+            // Write block to flash
+            if(write_data_to_flash_app(data_block, block_index_saved,
+                                      (firmware_received_size <= MAX_BLOCK_SIZE)) != HAL_OK)
+            {
+                printf("ERROR: Flash write failed!\r\n");
+                transfer_error_flag = true;
+            }
+        }
+
+        // Reset block buffer
+        block_index = 0;
+
+        // Calculate and prepare checksum response
+        checksum_response[0] = Calculate_Checksum(data_block, block_index_saved);
+        memset(data_block, 0, sizeof(data_block));
+    }
+
+    // Re-enable UART interrupt for next byte
+    HAL_UART_Receive_IT(&huart1, &uart_rx_byte, 1);
 }
+/**
+  * @brief  Firmware update main loop
+  * @retval None
+  */
 static void Firmware_Update(void)
 {
-	  while (1)
-  {
-			if(IlkSifre==10)
-			{
-				HAL_Delay(1);
-				HAL_UART_Transmit_IT(&huart1,DataGonder, 1);
-				Index=0;
-				IlkSifre=20;
-			}
-			if(IndexSum>0)
-			{
-				HAL_Delay(1);
-				HAL_UART_Transmit_IT(&huart1,Sum, 1);
-				IndexSum=0;
-			}
-			DataFlagCount++;
-			if(DataFlagCount%10==0)HAL_GPIO_TogglePin(BLed_GPIO_Port, BLed_Pin);
-			HAL_Delay(1);
-			if((current_app_size >= BlockLeng && (IlkSifre==20 && DataFlagCount>1000) )|| DataFlagCount>5000)
-			{
-				HAL_UART_Transmit_IT(&huart1,Sum, 1);
-				printf("Boot Finished...\r\n");
-				break;
+    const uint32_t TIMEOUT_MS = 50000;  // 50 second timeout
+    bool checksum_sent = false;
 
-			}
-		}
+    printf("Bootloader ready - waiting for firmware...\r\n");
+
+    while(1)
+    {
+        // Send ACK after successful handshake
+        if(bootloader_state == BOOTLOADER_STATE_TRANSFERRING && !checksum_sent)
+        {
+            HAL_Delay(1);
+            HAL_UART_Transmit_IT(&huart1, &ack_byte, 1);
+            checksum_sent = true;
+        }
+
+        // Send checksum response if block complete
+        if(block_index_saved > 0)
+        {
+            HAL_Delay(1);
+            HAL_UART_Transmit_IT(&huart1, checksum_response, 1);
+            block_index_saved = 0;
+        }
+
+        // LED heartbeat
+        idle_timeout_counter++;
+        if(idle_timeout_counter % 10 == 0)
+        {
+            HAL_GPIO_TogglePin(BLed_GPIO_Port, BLed_Pin);
+        }
+
+        HAL_Delay(1);
+
+        // Check transfer complete
+        if((firmware_received_size >= firmware_total_size) &&
+           (bootloader_state == BOOTLOADER_STATE_TRANSFERRING) &&
+           (idle_timeout_counter > 1000))
+        {
+            // Send final checksum
+            HAL_UART_Transmit_IT(&huart1, checksum_response, 1);
+            printf("Firmware transfer complete!\r\n");
+            bootloader_state = BOOTLOADER_STATE_COMPLETE;
+            break;
+        }
+
+        // Check timeout
+        if(idle_timeout_counter > TIMEOUT_MS)
+        {
+            printf("Timeout: No data received\r\n");
+            break;
+        }
+
+        // Check for errors
+        if(transfer_error_flag)
+        {
+            printf("Transfer error detected\r\n");
+            bootloader_state = BOOTLOADER_STATE_ERROR;
+            break;
+        }
+    }
 }
-static void Application( void )
+/**
+  * @brief  Jump to user application
+  * @retval None
+  */
+static void Application(void)
 {
-	printf("Application...\n");
-	void (*app_reset_handler)(void) = (void*)(*((volatile uint32_t*)(ETX_APP_START_ADDRESS + 4U)));
+    printf("Preparing to jump to application...\r\n");
 
-	if( app_reset_handler == (void*)0xFFFFFFFF )
-	{
-	  printf("Invalid Application... HALT!!!\r\n");
-	  while(1);
-	}
+    // Get application reset handler address
+    uint32_t app_reset_handler_address = *((volatile uint32_t*)(ETX_APP_START_ADDRESS + 4U));
+    void (*app_reset_handler)(void) = (void*)app_reset_handler_address;
 
-	__set_MSP(*(volatile uint32_t*) ETX_APP_START_ADDRESS);
+    // Validate application exists
+    if(app_reset_handler_address == 0xFFFFFFFF)
+    {
+        printf("ERROR: No valid application found!\r\n");
+        printf("Flash appears empty at 0x%08lX\r\n", ETX_APP_START_ADDRESS);
+        while(1)
+        {
+            HAL_GPIO_TogglePin(BLed_GPIO_Port, BLed_Pin);
+            HAL_Delay(200);  // Fast blink = error
+        }
+    }
 
-	// Turn OFF the Led to tell the user that Bootloader is not running
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET );
+    printf("Valid application found at 0x%08lX\r\n", ETX_APP_START_ADDRESS);
+    printf("Reset handler: 0x%08lX\r\n", app_reset_handler_address);
 
-	app_reset_handler();    //call the app reset handler
+    // Disable interrupts before jump
+    __disable_irq();
+
+    // Disable SysTick
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL  = 0;
+
+    // Set vector table offset
+    SCB->VTOR = ETX_APP_START_ADDRESS;
+
+    // Set stack pointer
+    __set_MSP(*((volatile uint32_t*)ETX_APP_START_ADDRESS));
+
+    // Turn off LED to indicate bootloader exit
+    HAL_GPIO_WritePin(BLed_GPIO_Port, BLed_Pin, GPIO_PIN_RESET);
+
+    // Jump to application
+    app_reset_handler();
+
+    // Should never reach here
+    while(1);
 }
 
 /* USER CODE END 4 */
