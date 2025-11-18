@@ -63,41 +63,38 @@ static void Firmware_Update( void );
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// UART RX
 uint8_t RPiDataByte=0;
-uint8_t BlockNumber1=0;
-uint8_t BlockNumber2=0;
-uint8_t BlockNumber3=0;
-uint8_t BlockLeng1=0;
-uint8_t BlockLeng2=0;
-uint8_t BlockLeng3=0;
-uint8_t BlockLeng4=0;
+
+// Data block reception
 uint8_t Block[1024];
 uint16_t Index=0;
-uint8_t BlockOk=0;
-uint8_t DataGonder[]={'O'};
-uint16_t BNumber=0;
-uint32_t BLeng=1024;
-
-uint32_t BlockLeng=1024;
-uint8_t   IndexCount=0;
-uint8_t   DataCount=0;
-uint16_t   Conter=0;
-char BlockTest[1024];
-uint8_t IlkSifre=0;
-
-uint32_t MaxIndex=1024;
-
-uint32_t BLengC=0;
-uint8_t Sum[1]={0};
 uint32_t IndexSum=0;
-uint8_t Sum1=0;
-uint8_t Sum2=0;
 
-uint16_t application_size = 0;
+// Protocol state machine
+uint8_t IlkSifre=0;  // 0=idle, 10=handshake_ok, 20=transferring
+uint8_t DataGonder[]={'O'};  // ACK byte
+
+// Size tracking
+uint32_t BLeng=1024;
+uint32_t BlockLeng=1024;
+uint32_t MaxIndex=1024;
+uint16_t current_app_size=0;
+
+// Checksum
+uint8_t Sum[1]={0};
+
+// Flash write (32-bit for F7)
 uint32_t application_write_idx = 0;
 
-uint16_t current_app_size=0;
+// Counters
+uint8_t DataCount=0;
 uint32_t DataFlagCount=0;
+
+// Removed unused variables:
+// BlockNumber1, BlockNumber2, BlockNumber3
+// BlockLeng1-4, BlockOk, BNumber, IndexCount
+// Conter, BlockTest, BLengC, Sum1, Sum2, application_size
 /* USER CODE END 0 */
 
 /**
@@ -415,7 +412,11 @@ static HAL_StatusTypeDef write_data_to_flash_app( uint8_t *data,
       EraseInitStruct.Sector        = FLASH_SECTOR_1;        // Start from Sector 1
       EraseInitStruct.NbSectors     = 7;                     // Erase Sectors 1-7
 
+      // CRITICAL: Disable interrupts during flash erase to prevent corruption
+      __disable_irq();
       ret = HAL_FLASHEx_Erase( &EraseInitStruct, &SectorError );
+      __enable_irq();
+
       if( ret != HAL_OK )
       {
         break;
@@ -523,7 +524,8 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 		if( ( Index == MAX_BLOCK_SIZE ) || ( current_app_size >= BlockLeng) )
 		{
 			printf("\rTransfer %d \r\n", ( BlockLeng-BLeng ));
-			if( write_data_to_flash_app(Block, MAX_BLOCK_SIZE, (current_app_size <= MAX_BLOCK_SIZE) ) != HAL_OK )
+			// FIXED: Write actual block size (IndexSum) instead of always MAX_BLOCK_SIZE
+			if( write_data_to_flash_app(Block, IndexSum, (current_app_size <= MAX_BLOCK_SIZE) ) != HAL_OK )
 			{
 				printf("HALT!!!\r\n");
 			}
