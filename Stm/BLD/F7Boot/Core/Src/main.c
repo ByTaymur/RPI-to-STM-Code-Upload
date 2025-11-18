@@ -28,8 +28,35 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#define MAX_BLOCK_SIZE          ( 1024 )                  //1KB
-#define ETX_APP_START_ADDRESS   0x08008000                // Sector 1 başlangıcı (32KB sonrası)
+// Memory configuration
+#define MAX_BLOCK_SIZE          1024                      // 1KB block size
+#define ETX_APP_START_ADDRESS   0x08008000                // Sector 1 start (after 32KB bootloader)
+#define MAX_FIRMWARE_SIZE       (992 * 1024)              // 992KB max for F7 (Sectors 1-7)
+
+// Protocol constants
+#define PROTOCOL_START_BYTE     '{'
+#define PROTOCOL_END_BYTE       '}'
+#define PROTOCOL_ACK_BYTE       'O'
+#define PROTOCOL_NACK_BYTE      'N'
+
+// Handshake validation
+#define HANDSHAKE_MIN_INDEX     4
+#define HANDSHAKE_MAX_INDEX     8
+
+// Flash configuration for STM32F7
+#define FLASH_ERASE_FIRST_SECTOR    FLASH_SECTOR_1        // Start sector
+#define FLASH_ERASE_SECTOR_COUNT    7                     // Sectors 1-7
+#define FLASH_VOLTAGE_RANGE_VAL     FLASH_VOLTAGE_RANGE_3 // 2.7V-3.6V
+
+// State machine - Clean enum instead of magic numbers
+typedef enum {
+    BOOTLOADER_STATE_IDLE = 0,
+    BOOTLOADER_STATE_HANDSHAKE_RECEIVED = 10,
+    BOOTLOADER_STATE_TRANSFERRING = 20,
+    BOOTLOADER_STATE_COMPLETE = 30,
+    BOOTLOADER_STATE_ERROR = 255
+} BootloaderState_t;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -59,42 +86,58 @@ static void CPU_CACHE_Enable(void);
 /* USER CODE BEGIN PFP */
 static void Application( void );
 static void Firmware_Update( void );
+
+// Helper functions for better code organization
+static uint8_t Calculate_Checksum(const uint8_t *block, uint32_t size);
+static void Reset_Transfer_State(void);
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-// UART RX
-uint8_t RPiDataByte=0;
+// ============================================================================
+// BOOTLOADER STATE MACHINE VARIABLES
+// ============================================================================
+static BootloaderState_t bootloader_state = BOOTLOADER_STATE_IDLE;
+static uint8_t ack_byte = PROTOCOL_ACK_BYTE;
 
-// Data block reception
-uint8_t Block[1024];
-uint16_t Index=0;
-uint32_t IndexSum=0;
+// ============================================================================
+// UART RECEPTION VARIABLES
+// ============================================================================
+static uint8_t uart_rx_byte = 0;
 
-// Protocol state machine
-uint8_t IlkSifre=0;  // 0=idle, 10=handshake_ok, 20=transferring
-uint8_t DataGonder[]={'O'};  // ACK byte
+// ============================================================================
+// DATA BLOCK RECEPTION VARIABLES
+// ============================================================================
+static uint8_t data_block[MAX_BLOCK_SIZE];
+static uint16_t block_index = 0;
+static uint32_t block_index_saved = 0;  // Saved before reset for checksum
 
-// Size tracking
-uint32_t BLeng=1024;
-uint32_t BlockLeng=1024;
-uint32_t MaxIndex=1024;
-uint16_t current_app_size=0;
+// ============================================================================
+// FIRMWARE SIZE TRACKING
+// ============================================================================
+static uint32_t firmware_total_size = 0;
+static uint32_t firmware_received_size = 0;
+static uint32_t bytes_remaining = MAX_BLOCK_SIZE;
+static uint32_t current_block_size = MAX_BLOCK_SIZE;
 
-// Checksum
-uint8_t Sum[1]={0};
+// ============================================================================
+// CHECKSUM VARIABLES
+// ============================================================================
+static uint8_t checksum_response[1] = {0};
 
-// Flash write (32-bit for F7)
-uint32_t application_write_idx = 0;
+// ============================================================================
+// FLASH WRITE VARIABLES (32-bit for STM32F7)
+// ============================================================================
+static uint32_t flash_write_index = 0;
 
-// Counters
-uint8_t DataCount=0;
-uint32_t DataFlagCount=0;
+// ============================================================================
+// TIMEOUT AND STATUS COUNTERS
+// ============================================================================
+static uint8_t handshake_count = 0;
+static uint32_t idle_timeout_counter = 0;
+static bool transfer_error_flag = false;
 
-// Removed unused variables:
-// BlockNumber1, BlockNumber2, BlockNumber3
-// BlockLeng1-4, BlockOk, BNumber, IndexCount
-// Conter, BlockTest, BLengC, Sum1, Sum2, application_size
 /* USER CODE END 0 */
 
 /**
